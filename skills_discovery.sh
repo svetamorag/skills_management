@@ -4,14 +4,15 @@
 #
 # Probes project, user and system skill roots for Claude Code, claude.ai /
 # Cowork / Skills API, Antigravity, Codex, GitHub Copilot, Cursor, Amp, Cline,
-# OpenCode, Warp and ADK, then prints one line per skill.
+# OpenCode, Warp and ADK, then prints one line per skill. With --json it prints
+# the same findings as a machine-readable document instead.
 #
 # Read-only. POSIX sh, no dependencies. Linux, macOS, WSL and Windows
 # (Git Bash / MSYS2 / Cygwin).
 # =============================================================================
 set -u
 
-SHOW_DESC=1; SHOW_EMPTY=0; MANIFESTS=0; USE_COLOR=1; TARGET=""; FILTER=""
+SHOW_DESC=1; SHOW_EMPTY=0; MANIFESTS=0; USE_COLOR=1; TARGET=""; FILTER=""; JSON=0
 
 usage() {
   cat <<'EOF'
@@ -22,6 +23,9 @@ Usage: skills-discovery.sh [OPTIONS] [WORKSPACE_DIR]
   -m, --include-manifests  also read skills declared in skills.json manifests
   -H, --harness NAME       filter: claude, claude.ai, codex, copilot, cursor,
                            antigravity, amp, cline, opencode, warp, adk
+  -j, --json               emit JSON on stdout instead of the report. Every
+                           probed root is listed with its state, so -e only
+                           affects the human-readable output.
   -n, --no-color           plain output
   -h, --help               this message
 EOF
@@ -32,6 +36,7 @@ while [ $# -gt 0 ]; do
     -d|--no-desc)           SHOW_DESC=0 ;;
     -e|--show-empty)        SHOW_EMPTY=1 ;;
     -m|--include-manifests) MANIFESTS=1 ;;
+    -j|--json)              JSON=1 ;;
     -n|--no-color)          USE_COLOR=0 ;;
     -H|--harness)
       [ $# -ge 2 ] || { echo "error: --harness needs a value" >&2; exit 1; }
@@ -42,6 +47,8 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+[ "$JSON" -eq 0 ] || USE_COLOR=0
 
 # -----------------------------------------------------------------------------
 # 1. Palette, glyphs, terminal width
@@ -280,6 +287,41 @@ short() { # absolute path -> ./relative or ~/relative
 }
 
 # -----------------------------------------------------------------------------
+# 4b. JSON helpers, used only by --json. Descriptions and !command directives
+#     are attacker-supplied text, so every value goes through jesc.
+# -----------------------------------------------------------------------------
+jesc() { # text -> JSON string body: quotes and backslashes escaped, no controls
+  printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/[[:cntrl:]]/ /g'
+}
+
+jstr() { printf '"%s"' "$(jesc "${1:-}")"; }
+
+jbool() { if [ "${1:-0}" -eq 1 ]; then printf 'true'; else printf 'false'; fi; }
+
+jarr_words() { # space-separated list -> JSON array
+  _ja=''
+  for _jw in ${1:-}; do _ja="$_ja${_ja:+, }\"$(jesc "$_jw")\""; done
+  printf '[%s]' "$_ja"
+}
+
+jarr_lines() { # newline-separated list -> JSON array
+  [ -n "${1:-}" ] || { printf '[]'; return 0; }
+  _ja=''
+  while IFS= read -r _jl; do
+    [ -n "$_jl" ] || continue
+    _ja="$_ja${_ja:+, }\"$(jesc "$_jl")\""
+  done <<EOF
+$1
+EOF
+  printf '[%s]' "$_ja"
+}
+
+jsep() { # comma before every element but the first
+  [ -s "$1" ] && printf ',\n' >> "$1"
+  return 0
+}
+
+# -----------------------------------------------------------------------------
 # 5. Candidate roots
 #    Tables are scope-agnostic: one row per documented path, with the harnesses
 #    that read it. Adding a harness means adding rows, not code.
@@ -288,8 +330,17 @@ CAND=$(mktemp "${TMPDIR:-/tmp}/skroots.XXXXXX")
 EXECF=$(mktemp "${TMPDIR:-/tmp}/skexec.XXXXXX")
 STATS=$(mktemp "${TMPDIR:-/tmp}/skstat.XXXXXX")
 MISS=$(mktemp "${TMPDIR:-/tmp}/skmiss.XXXXXX")
-trap 'rm -f "$CAND" "$EXECF" "$STATS" "$MISS"' EXIT INT TERM
+JROOTS=$(mktemp "${TMPDIR:-/tmp}/skjr.XXXXXX")
+JSKILLS=$(mktemp "${TMPDIR:-/tmp}/skjs.XXXXXX")
+trap 'rm -f "$CAND" "$EXECF" "$STATS" "$MISS" "$JROOTS" "$JSKILLS"' EXIT INT TERM
 SEEN='|'
+
+json_root() { # scope primary compat origin path state count
+  jsep "$JROOTS"
+  printf '    {"scope": %s, "state": %s, "skills": %d, "primary_harness": %s, "harnesses": %s, "origin": %s, "display": %s, "path": %s}' \
+    "$(jstr "$1")" "$(jstr "$6")" "$7" "$(jstr "$2")" "$(jarr_words "$3")" \
+    "$(jstr "$4")" "$(jstr "$(short "$5")")" "$(jstr "$5")" >> "$JROOTS"
+}
 
 add_root() { # scope primary compat path [origin tag]
   [ -n "$4" ] || return 0
@@ -476,14 +527,16 @@ done
 # 6. Header
 # -----------------------------------------------------------------------------
 PROBED=$(awk 'END {print NR+0}' "$CAND")
-section "AI SKILLS DISCOVERY" "$BLUE"
-printf ' %s%s%s %s %s%s%s' "$GREEN" "$OS_FAMILY" "$R" "$DOT" "$CYAN" "$(short "$WORKSPACE")" "$R"
-[ -n "$REPO" ] && [ "$REPO" != "$WORKSPACE" ] &&
-  printf ' %s %srepo %s%s' "$DOT" "$D" "$(short "$REPO")" "$R"
-printf ' %s %s%s roots probed%s\n' "$DOT" "$D" "$PROBED" "$R"
-printf ' %sflags%s  %sT%s allowed-tools  %s!%s !command  %sS%s scripts/  %sr%s references/  %s@%s symlink  %sA%s adk-meta  %s~%s name%sdir\n' \
-  "$D" "$R" "$RED" "$R" "$ORANGE" "$R" "$TEAL" "$R" "$BLUE" "$R" \
-  "$MAGENTA" "$R" "$YELLOW" "$R" "$GRAY" "$R" "$NE"
+if [ "$JSON" -eq 0 ]; then
+  section "AI SKILLS DISCOVERY" "$BLUE"
+  printf ' %s%s%s %s %s%s%s' "$GREEN" "$OS_FAMILY" "$R" "$DOT" "$CYAN" "$(short "$WORKSPACE")" "$R"
+  [ -n "$REPO" ] && [ "$REPO" != "$WORKSPACE" ] &&
+    printf ' %s %srepo %s%s' "$DOT" "$D" "$(short "$REPO")" "$R"
+  printf ' %s %s%s roots probed%s\n' "$DOT" "$D" "$PROBED" "$R"
+  printf ' %sflags%s  %sT%s allowed-tools  %s!%s !command  %sS%s scripts/  %sr%s references/  %s@%s symlink  %sA%s adk-meta  %s~%s name%sdir\n' \
+    "$D" "$R" "$RED" "$R" "$ORANGE" "$R" "$TEAL" "$R" "$BLUE" "$R" \
+    "$MAGENTA" "$R" "$YELLOW" "$R" "$GRAY" "$R" "$NE"
+fi
 
 # -----------------------------------------------------------------------------
 # 7. Render
@@ -495,14 +548,17 @@ render_root() { # scope primary compat tag root skills
   _n=0
   [ -n "$_list" ] && _n=$(printf '%s\n' "$_list" | awk 'END {print NR}')
 
-  printf '\n'
-  pill "$_scope"
-  printf ' %s%s%s %s%2d%s ' "$B$WHITE" "$(fit "$(short "$_root")" "$ROOT_W")" "$R" "$B$GREEN" "$_n" "$R"
-  badges "$_compat"
-  [ -n "$_tag" ] && printf ' %s(%s)%s' "$D" "$_tag" "$R"
-  printf '\n'
-
-  [ -n "$_list" ] || { printf ' %s%s empty%s\n' "$GRAY" "$TEND" "$R"; return 0; }
+  if [ "$JSON" -eq 0 ]; then
+    printf '\n'
+    pill "$_scope"
+    printf ' %s%s%s %s%2d%s ' "$B$WHITE" "$(fit "$(short "$_root")" "$ROOT_W")" "$R" "$B$GREEN" "$_n" "$R"
+    badges "$_compat"
+    [ -n "$_tag" ] && printf ' %s(%s)%s' "$D" "$_tag" "$R"
+    printf '\n'
+    [ -n "$_list" ] || { printf ' %s%s empty%s\n' "$GRAY" "$TEND" "$R"; return 0; }
+  else
+    [ -n "$_list" ] || return 0
+  fi
 
   _i=0
   printf '%s\n' "$_list" | while IFS= read -r md; do
@@ -514,22 +570,55 @@ render_root() { # scope primary compat tag root skills
     [ "$_i" -eq "$_n" ] && tree=$TEND || tree=$TMID
 
     # flags: plain copy drives the column width, colored copy gets printed
-    f=''; cf=''; scripts=0; bang=0; tools=0
+    f=''; cf=''; scripts=0; bang=0; tools=0; refs=0; link=0; adkm=0; alias=0
+    tools_val=''
     if grep -qE '^allowed[-_]tools:' "$md" 2>/dev/null; then
       tools=1; f="${f}T"; cf="$cf$B$RED""T$R"
+      tools_val=$(frontmatter "$md" 'allowed[-_]tools')
     fi
     cmds=$(bang_commands "$md")
     [ -n "$cmds" ] && { bang=1; f="${f}!"; cf="$cf$B$ORANGE""!$R"; }
     [ -d "$dir/scripts" ] && { scripts=1; f="${f}S"; cf="$cf$B$TEAL""S$R"; }
-    [ -d "$dir/references" ] && { f="${f}r"; cf="$cf$BLUE""r$R"; }
-    [ -L "$dir" ] && { f="${f}@"; cf="$cf$MAGENTA""@$R"; }
+    [ -d "$dir/references" ] && { refs=1; f="${f}r"; cf="$cf$BLUE""r$R"; }
+    [ -L "$dir" ] && { link=1; f="${f}@"; cf="$cf$MAGENTA""@$R"; }
     grep -qE 'adk_additional_tools|adk_inject_state' "$md" 2>/dev/null &&
-      { f="${f}A"; cf="$cf$YELLOW""A$R"; }
-    [ -n "$name" ] && [ "$name" != "$folder" ] && { f="${f}~"; cf="$cf$GRAY""~$R"; }
+      { adkm=1; f="${f}A"; cf="$cf$YELLOW""A$R"; }
+    [ -n "$name" ] && [ "$name" != "$folder" ] && { alias=1; f="${f}~"; cf="$cf$GRAY""~$R"; }
+    isexec=0
+    { [ "$scripts" -eq 1 ] || [ "$bang" -eq 1 ]; } && isexec=1
 
     printf '%d|%d|%d\n' "$scripts" "$bang" "$tools" >> "$STATS"
-    [ "$scripts" -eq 1 ] || [ "$bang" -eq 1 ] &&
+    [ "$isexec" -eq 1 ] &&
       printf '%s|%s|%s|%d|%d|%s\n' "$_scope" "$folder" "$_compat" "$scripts" "$bang" "$md" >> "$EXECF"
+
+    if [ "$JSON" -eq 1 ]; then
+      jsep "$JSKILLS"
+      {
+        printf '    {\n'
+        printf '      "name": %s,\n'                     "$(jstr "${name:-$folder}")"
+        printf '      "folder": %s,\n'                   "$(jstr "$folder")"
+        printf '      "description": %s,\n'              "$(jstr "$desc")"
+        printf '      "scope": %s,\n'                    "$(jstr "$_scope")"
+        printf '      "primary_harness": %s,\n'          "$(jstr "$_prim")"
+        printf '      "harnesses": %s,\n'                "$(jarr_words "$_compat")"
+        printf '      "origin": %s,\n'                   "$(jstr "$_tag")"
+        printf '      "root": %s,\n'                     "$(jstr "$_root")"
+        printf '      "path": %s,\n'                     "$(jstr "$dir")"
+        printf '      "display": %s,\n'                  "$(jstr "$(short "$dir")")"
+        printf '      "flags": %s,\n'                    "$(jstr "$f")"
+        printf '      "executable": %s,\n'               "$(jbool "$isexec")"
+        printf '      "allowed_tools": %s,\n'            "$(jbool "$tools")"
+        printf '      "allowed_tools_value": %s,\n'      "$(jstr "$tools_val")"
+        printf '      "bang_commands": %s,\n'            "$(jarr_lines "$cmds")"
+        printf '      "scripts": %s,\n'                  "$(jarr_lines "$(skill_scripts "$dir")")"
+        printf '      "references": %s,\n'               "$(jbool "$refs")"
+        printf '      "symlink": %s,\n'                  "$(jbool "$link")"
+        printf '      "adk_metadata": %s,\n'             "$(jbool "$adkm")"
+        printf '      "name_differs_from_folder": %s\n'  "$(jbool "$alias")"
+        printf '    }'
+      } >> "$JSKILLS"
+      continue
+    fi
 
     printf ' %s%s%s %s%s%s %s' "$GRAY" "$tree" "$R" "$GREEN" "$(fit "$folder" "$NAME_W")" "$R" "$cf"
     if [ "$SHOW_DESC" -eq 1 ] && [ -n "$desc" ]; then
@@ -542,15 +631,19 @@ render_root() { # scope primary compat tag root skills
 while IFS='|' read -r scope primary compat tag root; do
   if [ ! -e "$root" ]; then
     printf '%s|absent|%s\n' "$scope" "$root" >> "$MISS"
+    [ "$JSON" -eq 1 ] && json_root "$scope" "$primary" "$compat" "$tag" "$root" absent 0
     continue
   fi
   list=$(skill_files "$root")
   if [ -z "$list" ]; then
     printf '%s|empty|%s\n' "$scope" "$root" >> "$MISS"
+    [ "$JSON" -eq 1 ] && json_root "$scope" "$primary" "$compat" "$tag" "$root" empty 0
     [ "$SHOW_EMPTY" -eq 1 ] || continue
   fi
   n=0
   [ -n "$list" ] && n=$(printf '%s\n' "$list" | awk 'END {print NR}')
+  [ "$JSON" -eq 1 ] && [ "$n" -gt 0 ] &&
+    json_root "$scope" "$primary" "$compat" "$tag" "$root" active "$n"
   ROOTS=$((ROOTS + 1)); TOTAL=$((TOTAL + n))
   case $scope in
     LOCAL)  N_LOCAL=$((N_LOCAL + n)) ;;
@@ -579,6 +672,8 @@ if [ "$MANIFESTS" -eq 1 ]; then
       "$WORKSPACE"*) msc=LOCAL; N_LOCAL=$((N_LOCAL + mn)) ;;
       *)             msc=USER;  N_USER=$((N_USER + mn)) ;;
     esac
+    [ "$JSON" -eq 1 ] &&
+      json_root "$msc" antigravity "antigravity adk" manifest "$sj" active "$mn"
     render_root "$msc" antigravity "antigravity adk" manifest "$sj" "$mlist"
   done
 fi
@@ -593,60 +688,102 @@ if [ -s "$STATS" ]; then
     END { printf "N_EXEC=%d N_SCRIPTS=%d N_BANG=%d N_TOOLS=%d\n", e+0, s+0, b+0, t+0 }' "$STATS")"
 fi
 
-section "EXECUTABLE SKILLS $DOT $N_EXEC of $TOTAL" "$YELLOW"
-if [ "$N_EXEC" -eq 0 ]; then
-  printf ' %snone: every skill found is instructions only%s\n' "$GRAY" "$R"
-else
-  while IFS='|' read -r e_scope e_name e_compat e_scripts e_bang e_md; do
-    [ -n "$e_md" ] || continue
-    e_dir=$(dirname "$e_md")
-    printf '\n'
-    pill "$e_scope"
-    printf ' %s%s%s %s%s%s ' "$B$GREEN" "$(fit "$e_name" "$NAME_W")" "$R" \
-      "$CYAN" "$(clip "$(short "$e_dir")" $((WIDTH - NAME_W - 32)))" "$R"
-    badges "$e_compat"
-    printf '\n'
-    if [ "$e_scripts" -eq 1 ]; then
-      files=$(skill_scripts "$e_dir" | awk '{printf "  %s", $0} END {printf "\n"}')
-      [ -n "$files" ] || files='  (empty)'
-      printf '   %s%sS%s %s%s%s\n' "$B" "$TEAL" "$R" "$WHITE" "$(clip "$files" $((WIDTH - 6)))" "$R"
-    fi
-    if [ "$e_bang" -eq 1 ]; then
-      bang_commands "$e_md" | head -n 6 | while IFS= read -r bc; do
-        [ -n "$bc" ] && printf '   %s%s!%s %s%s%s\n' "$B" "$ORANGE" "$R" "$ORANGE" \
-          "$(clip "$bc" $((WIDTH - 6)))" "$R"
-      done
-    fi
-  done < "$EXECF"
+if [ "$JSON" -eq 0 ]; then
+  section "EXECUTABLE SKILLS $DOT $N_EXEC of $TOTAL" "$YELLOW"
+  if [ "$N_EXEC" -eq 0 ]; then
+    printf ' %snone: every skill found is instructions only%s\n' "$GRAY" "$R"
+  else
+    while IFS='|' read -r e_scope e_name e_compat e_scripts e_bang e_md; do
+      [ -n "$e_md" ] || continue
+      e_dir=$(dirname "$e_md")
+      printf '\n'
+      pill "$e_scope"
+      printf ' %s%s%s %s%s%s ' "$B$GREEN" "$(fit "$e_name" "$NAME_W")" "$R" \
+        "$CYAN" "$(clip "$(short "$e_dir")" $((WIDTH - NAME_W - 32)))" "$R"
+      badges "$e_compat"
+      printf '\n'
+      if [ "$e_scripts" -eq 1 ]; then
+        files=$(skill_scripts "$e_dir" | awk '{printf "  %s", $0} END {printf "\n"}')
+        [ -n "$files" ] || files='  (empty)'
+        printf '   %s%sS%s %s%s%s\n' "$B" "$TEAL" "$R" "$WHITE" "$(clip "$files" $((WIDTH - 6)))" "$R"
+      fi
+      if [ "$e_bang" -eq 1 ]; then
+        bang_commands "$e_md" | head -n 6 | while IFS= read -r bc; do
+          [ -n "$bc" ] && printf '   %s%s!%s %s%s%s\n' "$B" "$ORANGE" "$R" "$ORANGE" \
+            "$(clip "$bc" $((WIDTH - 6)))" "$R"
+        done
+      fi
+    done < "$EXECF"
+  fi
 fi
 
 # -----------------------------------------------------------------------------
 # 9. Summary
 # -----------------------------------------------------------------------------
-section SUMMARY "$BLUE"
-if [ "$TOTAL" -eq 0 ]; then
-  printf ' %sno skills found in %s probed roots%s  (%s-e%s lists every path checked)\n' \
-    "$YELLOW" "$PROBED" "$R" "$B" "$R"
-else
-  printf '  %sOverall Skills Found:%s      %s%d total skill(s)%s across %s%d active folder(s)%s\n' \
-    "$B$WHITE" "$R" "$B$GREEN" "$TOTAL" "$R" "$B$CYAN" "$ROOTS" "$R"
-  printf '  %sSkills with Executables:%s   %s%d executable skill(s)%s of %s%d total%s (%s%d instruction-only%s)\n' \
-    "$B$WHITE" "$R" "$B$YELLOW" "$N_EXEC" "$R" "$B$WHITE" "$TOTAL" "$R" \
-    "$GRAY" "$((TOTAL - N_EXEC))" "$R"
-  printf '    %s%s%s With "scripts/" dir:%s  %s%d skill(s)%s\n' \
-    "$D" "$TMID" "$RULE" "$R" "$B$TEAL" "$N_SCRIPTS" "$R"
-  printf '    %s%s%s With "!command":%s      %s%d skill(s)%s\n' \
-    "$D" "$TMID" "$RULE" "$R" "$B$ORANGE" "$N_BANG" "$R"
-  printf '    %s%s%s Declares allowed-tools:%s %s%d skill(s)%s\n' \
-    "$D" "$TEND" "$RULE" "$R" "$B$RED" "$N_TOOLS" "$R"
-  printf '  %sSkills by Scope:%s           %sLocal/Project: %d%s  |  %sUser/Global: %d%s  |  %sSystem: %d%s\n' \
-    "$B$WHITE" "$R" "$CYAN" "$N_LOCAL" "$R" "$MAGENTA" "$N_USER" "$R" "$RED" "$N_SYS" "$R"
+if [ "$JSON" -eq 0 ]; then
+  section SUMMARY "$BLUE"
+  if [ "$TOTAL" -eq 0 ]; then
+    printf ' %sno skills found in %s probed roots%s  (%s-e%s lists every path checked)\n' \
+      "$YELLOW" "$PROBED" "$R" "$B" "$R"
+  else
+    printf '  %sOverall Skills Found:%s      %s%d total skill(s)%s across %s%d active folder(s)%s\n' \
+      "$B$WHITE" "$R" "$B$GREEN" "$TOTAL" "$R" "$B$CYAN" "$ROOTS" "$R"
+    printf '  %sSkills with Executables:%s   %s%d executable skill(s)%s of %s%d total%s (%s%d instruction-only%s)\n' \
+      "$B$WHITE" "$R" "$B$YELLOW" "$N_EXEC" "$R" "$B$WHITE" "$TOTAL" "$R" \
+      "$GRAY" "$((TOTAL - N_EXEC))" "$R"
+    printf '    %s%s%s With "scripts/" dir:%s  %s%d skill(s)%s\n' \
+      "$D" "$TMID" "$RULE" "$R" "$B$TEAL" "$N_SCRIPTS" "$R"
+    printf '    %s%s%s With "!command":%s      %s%d skill(s)%s\n' \
+      "$D" "$TMID" "$RULE" "$R" "$B$ORANGE" "$N_BANG" "$R"
+    printf '    %s%s%s Declares allowed-tools:%s %s%d skill(s)%s\n' \
+      "$D" "$TEND" "$RULE" "$R" "$B$RED" "$N_TOOLS" "$R"
+    printf '  %sSkills by Scope:%s           %sLocal/Project: %d%s  |  %sUser/Global: %d%s  |  %sSystem: %d%s\n' \
+      "$B$WHITE" "$R" "$CYAN" "$N_LOCAL" "$R" "$MAGENTA" "$N_USER" "$R" "$RED" "$N_SYS" "$R"
+  fi
+
+  if [ "$SHOW_EMPTY" -eq 1 ] && [ -s "$MISS" ]; then
+    section "PROBED, NOTHING THERE" "$GRAY"
+    while IFS='|' read -r m_scope m_state m_root; do
+      printf ' %s%-7s %-52.52s %s%s\n' "$D" "$m_scope" "$(short "$m_root")" "$m_state" "$R"
+    done < "$MISS"
+  fi
+  printf '\n'
+  exit 0
 fi
 
-if [ "$SHOW_EMPTY" -eq 1 ] && [ -s "$MISS" ]; then
-  section "PROBED, NOTHING THERE" "$GRAY"
-  while IFS='|' read -r m_scope m_state m_root; do
-    printf ' %s%-7s %-52.52s %s%s\n' "$D" "$m_scope" "$(short "$m_root")" "$m_state" "$R"
-  done < "$MISS"
-fi
-printf '\n'
+# -----------------------------------------------------------------------------
+# 10. JSON document. Same findings as the report, in the order a reader wants
+#     them: what ran, what it adds up to, where it looked, what it found.
+# -----------------------------------------------------------------------------
+NOW=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf '')
+
+printf '{\n'
+printf '  "schema": "skills-discovery/1",\n'
+printf '  "generated_at": %s,\n' "$(jstr "$NOW")"
+printf '  "host": {\n'
+printf '    "os_family": %s,\n'        "$(jstr "$OS_FAMILY")"
+printf '    "workspace": %s,\n'        "$(jstr "$WORKSPACE")"
+printf '    "repo": %s,\n'             "$(jstr "$REPO")"
+printf '    "home": %s,\n'             "$(jstr "$HOME_D")"
+printf '    "harness_filter": %s,\n'   "$(jstr "$FILTER")"
+printf '    "include_manifests": %s,\n' "$(jbool "$MANIFESTS")"
+printf '    "roots_probed": %d\n'      "$PROBED"
+printf '  },\n'
+printf '  "summary": {\n'
+printf '    "skills": %d,\n'              "$TOTAL"
+printf '    "active_roots": %d,\n'        "$ROOTS"
+printf '    "executable": %d,\n'          "$N_EXEC"
+printf '    "instruction_only": %d,\n'    "$((TOTAL - N_EXEC))"
+printf '    "with_scripts": %d,\n'        "$N_SCRIPTS"
+printf '    "with_bang_commands": %d,\n'  "$N_BANG"
+printf '    "with_allowed_tools": %d,\n'  "$N_TOOLS"
+printf '    "by_scope": {"local": %d, "user": %d, "system": %d}\n' \
+  "$N_LOCAL" "$N_USER" "$N_SYS"
+printf '  },\n'
+printf '  "roots": [\n'
+[ -s "$JROOTS" ] && { cat "$JROOTS"; printf '\n'; }
+printf '  ],\n'
+printf '  "skills": [\n'
+[ -s "$JSKILLS" ] && { cat "$JSKILLS"; printf '\n'; }
+printf '  ]\n'
+printf '}\n'
